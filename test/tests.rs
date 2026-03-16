@@ -389,7 +389,7 @@ testerrored!(
 testerrored!(
     err_lit_big2a,
     &b"\x02\xf0hi"[..],
-    Error::Literal { len: 4, src_len: 2, dst_len: 2 }
+    Error::LiteralBigLen { len: 61, src_len: 2, dst_len: 2 }
 );
 // A literal whose length is too big, requires 1 extra byte to be read,
 // src is too short to read the full literal.
@@ -448,21 +448,21 @@ testerrored!(
 testerrored!(
     err_copy_offset_zero,
     &b"\x11\x00a\x01\x00"[..],
-    Error::Offset { offset: 0, dst_pos: 1 }
+    Error::Offset { offset: 0, dst_pos: 1, len: 0 }
 );
 
 // A copy operation whose offset is too big.
 testerrored!(
     err_copy_offset_big,
     &b"\x11\x00a\x01\xFF"[..],
-    Error::Offset { offset: 255, dst_pos: 1 }
+    Error::Offset { offset: 255, dst_pos: 1, len: 0 }
 );
 
 // A copy operation whose length is too big.
 testerrored!(
     err_copy_len_big,
     &b"\x05\x00a\x1d\x01"[..],
-    Error::CopyWrite { len: 11, dst_len: 4 }
+    Error::CopyWrite { len: 11, dst_len: 4, offset: 1 }
 );
 
 // Selected random inputs pulled from quickcheck failure witnesses.
@@ -641,4 +641,241 @@ fn depress_cpp(bytes: &[u8]) -> Vec<u8> {
     let n = cpp::decompress(bytes, &mut buf).unwrap();
     buf.truncate(n);
     buf
+}
+
+/// Helper: compress data, then decompress using decompress_scattered with
+/// the given input/output chunk sizes. Returns the decompressed bytes.
+fn depress_scattered(
+    data: &[u8],
+    input_chunk: usize,
+    output_chunk: usize,
+) -> Vec<u8> {
+    let compressed = press(data);
+    let dlen = decompress_len(&compressed).unwrap();
+
+    // Split compressed data into input chunks.
+    let input_bufs: Vec<&[u8]> = if input_chunk == 0 || compressed.is_empty()
+    {
+        vec![&compressed]
+    } else {
+        compressed.chunks(input_chunk).collect()
+    };
+
+    // Create output buffers of the given chunk size.
+    let mut output_data = vec![0u8; dlen];
+    let output_bufs: Vec<&mut [u8]> = if output_chunk == 0 || dlen == 0
+    {
+        vec![&mut output_data]
+    } else {
+        output_data.chunks_mut(output_chunk).collect()
+    };
+
+    let n = Decoder::new()
+        .decompress_scattered(&input_bufs, output_bufs)
+        .unwrap();
+    assert_eq!(n, dlen);
+    output_data
+}
+
+// Tests for decompress_scattered.
+
+#[test]
+fn scattered_single_buffers() {
+    // Equivalent to normal decompress: one input, one output buffer.
+    let data = b"Hello, world! This is a test of Snappy compression.";
+    let result = depress_scattered(data, 0, 0);
+    assert_eq!(&result, data);
+}
+
+#[test]
+fn scattered_empty() {
+    let data = b"";
+    let compressed = press(data);
+    let input_bufs: Vec<&[u8]> = vec![&compressed];
+    let mut output_data = vec![0u8; 0];
+    let mut output_bufs: Vec<&mut [u8]> = vec![&mut output_data];
+    let n = Decoder::new()
+        .decompress_scattered(&input_bufs, output_bufs)
+        .unwrap();
+    assert_eq!(n, 0);
+}
+
+#[test]
+fn scattered_multi_input_single_output() {
+    let data = b"Hello, world! Hello, world! Hello, world!";
+    // Split compressed data into small chunks.
+    let result = depress_scattered(data, 3, 0);
+    assert_eq!(&result[..], &data[..]);
+}
+
+#[test]
+fn scattered_single_input_multi_output() {
+    let data = b"AAAAAAAAAAAAAAAAAAAAAAAABBBBBBBBBBBBCCCC";
+    let result = depress_scattered(data, 0, 5);
+    assert_eq!(&result[..], &data[..]);
+}
+
+#[test]
+fn scattered_multi_input_multi_output() {
+    let data = b"The quick brown fox jumps over the lazy dog. \
+                 The quick brown fox jumps over the lazy dog.";
+    // Small chunks for both input and output.
+    let result = depress_scattered(data, 7, 11);
+    assert_eq!(&result[..], &data[..]);
+}
+
+#[test]
+fn scattered_with_empty_input_buffers() {
+    let data = b"Testing with empty buffers interspersed";
+    let compressed = press(data);
+    let dlen = decompress_len(&compressed).unwrap();
+
+    // Split compressed data and intersperse empty buffers.
+    let chunks: Vec<&[u8]> = compressed.chunks(4).collect();
+    let mut input_bufs: Vec<&[u8]> = Vec::new();
+    let empty: &[u8] = &[];
+    input_bufs.push(empty);
+    for chunk in &chunks {
+        input_bufs.push(chunk);
+        input_bufs.push(empty);
+    }
+
+    let mut output_data = vec![0u8; dlen];
+    let mut output_bufs: Vec<&mut [u8]> = vec![&mut output_data];
+    let n = Decoder::new()
+        .decompress_scattered(&input_bufs, output_bufs)
+        .unwrap();
+    assert_eq!(n, dlen);
+    assert_eq!(&output_data[..], &data[..]);
+}
+
+#[test]
+fn scattered_with_empty_output_buffers() {
+    let data = b"Testing with empty output buffers";
+    let compressed = press(data);
+    let dlen = decompress_len(&compressed).unwrap();
+
+    let mut output_data = vec![0u8; dlen];
+    // Split into chunks and intersperse empty slices.
+    let mut output_bufs: Vec<&mut [u8]> = Vec::new();
+    let mut remaining = &mut output_data[..];
+    while remaining.len() > 5 {
+        let (chunk, rest) = remaining.split_at_mut(5);
+        let (empty, rest) = rest.split_at_mut(0);
+        output_bufs.push(chunk);
+        output_bufs.push(empty);
+        remaining = rest;
+    }
+    output_bufs.push(remaining);
+
+    let input_bufs: Vec<&[u8]> = vec![&compressed];
+    let n = Decoder::new()
+        .decompress_scattered(&input_bufs, output_bufs)
+        .unwrap();
+    assert_eq!(n, dlen);
+    assert_eq!(&output_data[..], &data[..]);
+}
+
+#[test]
+fn scattered_one_byte_chunks() {
+    // Extreme: every byte in its own buffer.
+    let data = b"abcdefghijklmnop";
+    let result = depress_scattered(data, 1, 1);
+    assert_eq!(&result[..], &data[..]);
+}
+
+#[test]
+fn scattered_copy_across_output_boundary() {
+    // Create data with repeats so Snappy uses back-references.
+    let data = b"ABCDABCDABCDABCDABCDABCD";
+    // Use output chunks big enough for the largest single operation
+    // (Snappy emits a copy of length 20 for the repeated "ABCD" pattern).
+    let result = depress_scattered(data, 0, 20);
+    assert_eq!(&result[..], &data[..]);
+}
+
+#[test]
+fn scattered_large_literal() {
+    // Create data that doesn't compress well (random-ish bytes).
+    let data: Vec<u8> = (0..1000).map(|i| (i * 7 + 13) as u8).collect();
+    let result = depress_scattered(&data, 50, 50);
+    assert_eq!(result, data);
+}
+
+#[test]
+fn scattered_run_length_copy() {
+    // A long run of the same byte triggers offset=1 back-references.
+    let data = vec![b'X'; 200];
+    let result = depress_scattered(&data, 10, 10);
+    assert_eq!(result, data);
+}
+
+#[test]
+fn scattered_buffer_too_small() {
+    let data = b"Some data to compress";
+    let compressed = press(data);
+    let input_bufs: Vec<&[u8]> = vec![&compressed];
+    // Output is too small.
+    let mut output_data = vec![0u8; 5];
+    let mut output_bufs: Vec<&mut [u8]> = vec![&mut output_data];
+    let err = Decoder::new()
+        .decompress_scattered(&input_bufs, output_bufs)
+        .unwrap_err();
+    match err {
+        Error::BufferTooSmall { .. } => {}
+        other => panic!("expected BufferTooSmall, got {:?}", other),
+    }
+}
+
+#[test]
+fn scattered_empty_input_error() {
+    let input_bufs: Vec<&[u8]> = vec![&[], &[]];
+    let mut output_data = vec![0u8; 100];
+    let mut output_bufs: Vec<&mut [u8]> = vec![&mut output_data];
+    let err = Decoder::new()
+        .decompress_scattered(&input_bufs, output_bufs)
+        .unwrap_err();
+    assert_eq!(err, Error::Empty);
+}
+
+#[test]
+fn scattered_matches_contiguous_decompress() {
+    // Verify scattered decompress gives the same result as contiguous.
+    let all_bytes: Vec<u8> = (0..=255).collect();
+    let test_cases: Vec<&[u8]> = vec![
+        b"",
+        b"a",
+        b"ab",
+        b"Hello, world!",
+        b"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+        &[0u8; 1024],
+        &all_bytes,
+    ];
+    for data in test_cases {
+        if data.is_empty() {
+            continue;
+        }
+        let expected = depress(&press(data));
+        let result = depress_scattered(data, 7, 13);
+        assert_eq!(
+            result, expected,
+            "mismatch for data of length {}",
+            data.len()
+        );
+    }
+}
+
+#[test]
+fn scattered_quickcheck_roundtrip() {
+    fn prop(data: Vec<u8>) -> TestResult {
+        if data.is_empty() {
+            return TestResult::discard();
+        }
+        let result = depress_scattered(&data, 17, 23);
+        TestResult::from_bool(result == data)
+    }
+    QuickCheck::new()
+        .gen(StdGen::new(rand::thread_rng(), 10_000))
+        .tests(1_000)
+        .quickcheck(prop as fn(Vec<u8>) -> TestResult);
 }

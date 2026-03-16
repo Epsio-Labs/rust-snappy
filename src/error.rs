@@ -113,6 +113,15 @@ pub enum Error {
         /// The number of remaining slots in the decompression buffer.
         dst_len: u64,
     },
+    ///
+    LiteralBigLen {
+        /// The expected length of the literal.
+        len: u64,
+        /// The number of remaining bytes in the compressed bytes.
+        src_len: u64,
+        /// The number of remaining slots in the decompression buffer.
+        dst_len: u64,
+    },
     /// This error occurs during decompression when there was a problem
     /// reading a copy.
     CopyRead {
@@ -130,6 +139,8 @@ pub enum Error {
         len: u64,
         /// The number of remaining bytes in the decompression buffer.
         dst_len: u64,
+        /// The copy offset.
+        offset: u64,
     },
     /// This error occurs during decompression when an invalid copy offset
     /// is found. An offset is invalid if it is zero or if it is out of bounds.
@@ -139,6 +150,8 @@ pub enum Error {
         /// The current position in the decompression buffer. If the offset is
         /// non-zero, then the offset must be greater than this position.
         dst_pos: u64,
+        ///
+        len: usize
     },
     /// This error occurs when a stream header chunk type was expected but got
     /// a different chunk type.
@@ -209,16 +222,20 @@ impl PartialEq for Error {
                 &Literal { len: len2, src_len: src_len2, dst_len: dst_len2 },
             ) => (len1, src_len1, dst_len1) == (len2, src_len2, dst_len2),
             (
+                &LiteralBigLen { len: len1, src_len: src_len1, dst_len: dst_len1 },
+                &LiteralBigLen { len: len2, src_len: src_len2, dst_len: dst_len2 },
+            ) => (len1, src_len1, dst_len1) == (len2, src_len2, dst_len2),
+            (
                 &CopyRead { len: len1, src_len: src_len1 },
                 &CopyRead { len: len2, src_len: src_len2 },
             ) => (len1, src_len1) == (len2, src_len2),
             (
-                &CopyWrite { len: len1, dst_len: dst_len1 },
-                &CopyWrite { len: len2, dst_len: dst_len2 },
+                &CopyWrite { len: len1, dst_len: dst_len1, .. },
+                &CopyWrite { len: len2, dst_len: dst_len2, .. },
             ) => (len1, dst_len1) == (len2, dst_len2),
             (
-                &Offset { offset: offset1, dst_pos: dst_pos1 },
-                &Offset { offset: offset2, dst_pos: dst_pos2 },
+                &Offset { offset: offset1, dst_pos: dst_pos1, len: _ },
+                &Offset { offset: offset2, dst_pos: dst_pos2 , len: _len2},
             ) => (offset1, dst_pos1) == (offset2, dst_pos2),
             (&StreamHeader { byte: byte1 }, &StreamHeader { byte: byte2 }) => {
                 byte1 == byte2
@@ -283,13 +300,13 @@ impl fmt::Display for Error {
                          length {}; remaining src: {})",
                 len, src_len
             ),
-            Error::CopyWrite { len, dst_len } => write!(
+            Error::CopyWrite { len, dst_len, .. } => write!(
                 f,
                 "snappy: corrupt input (expected copy write of \
                          length {}; remaining dst: {})",
                 len, dst_len
             ),
-            Error::Offset { offset, dst_pos } => write!(
+            Error::Offset { offset, dst_pos, .. } => write!(
                 f,
                 "snappy: corrupt input (expected valid offset but \
                          got offset {}; dst position: {})",
@@ -330,6 +347,10 @@ impl fmt::Display for Error {
                          expected: {}, got: {})",
                 expected, got
             ),
+            _ => write!(
+                f,
+                "snappy: other"
+            )
         }
     }
 }

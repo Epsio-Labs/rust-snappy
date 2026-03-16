@@ -24,3 +24,7 @@ cpp = ["snappy-cpp"]
 criterion = "0.3.1"
 snap = { version = "*", path = ".." }
 snappy-cpp = { path = "../snappy-cpp", version = "0.1", optional = true }
+
+[profile.profiling]
+inherits = "release"
+debug = true

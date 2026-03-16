@@ -1,5 +1,4 @@
-use std::ptr;
-
+use std::{mem, ptr};
 use crate::bytes;
 use crate::error::{Error, Result};
 use crate::tag;
@@ -93,6 +92,7 @@ impl Decoder {
         dec.decompress()?;
         Ok(dec.dst.len())
     }
+    
 
     /// Decompresses all bytes in `input` into a freshly allocated `Vec`.
     ///
@@ -107,6 +107,67 @@ impl Decoder {
         let n = self.decompress(input, &mut buf)?;
         buf.truncate(n);
         Ok(buf)
+    }
+
+    /// Decompresses all bytes in scattered `input` buffers into scattered
+    /// `output` buffers.
+    ///
+    /// This is like `decompress`, but operates on multiple non-contiguous
+    /// input and output buffers (scattered/vectored I/O). This is useful
+    /// for scenarios like network I/O (readv/writev), memory-mapped
+    /// regions, or avoiding large contiguous allocations.
+    ///
+    /// `input` is a slice of byte slices representing the compressed data
+    /// spread across multiple buffers. `output` is a mutable slice of
+    /// mutable byte slices where the decompressed data will be written.
+    ///
+    /// The total size of `output` buffers must be large enough to hold all
+    /// decompressed bytes.
+    ///
+    /// On success, this returns the number of bytes written to `output`.
+    ///
+    /// # Errors
+    ///
+    /// This method returns an error under the same circumstances as
+    /// `decompress`.
+    pub fn decompress_scattered<'a>(
+        &mut self,
+        input: &[&[u8]],
+        mut output: Vec<&'a mut [u8]>,
+    ) -> Result<usize> {
+        let total_input: usize = input.iter().map(|b| b.len()).sum();
+        if total_input == 0 {
+            return Err(Error::Empty);
+        }
+        let dst_len: usize = output.iter().map(|b| b.len()).sum();
+
+        // Find the first non-empty input buffer for reading the header.
+        let first_idx = input.iter().position(|b| !b.is_empty())
+            .ok_or(Error::Empty)?;
+        let src = input[first_idx];
+        let hdr = Header::read(src)?;
+
+        if hdr.decompress_len > dst_len {
+            return Err(Error::BufferTooSmall {
+                given: dst_len as u64,
+                min: hdr.decompress_len as u64,
+            });
+        }
+
+        // Reverse so pop() yields buffers in forward order.
+        output.reverse();
+        let mut dec = DecompressScattered {
+            src_buffers: input,
+            src,
+            s: hdr.len,
+            src_index: first_idx,
+            dst: output.pop().unwrap(),
+            dst_buffers: output,
+            result_slices: vec![],
+            d: 0,
+        };
+        dec.decompress()?;
+        Ok(hdr.decompress_len)
     }
 }
 
@@ -127,17 +188,40 @@ impl<'s, 'd> Decompress<'s, 'd> {
     ///
     /// This assumes that the header has already been read and that `dst` is
     /// big enough to store all decompressed bytes.
-    fn decompress(&mut self) -> Result<()> {
+    /// Process all tags in the current src buffer.
+    #[inline(always)]
+    fn decompress_tags(&mut self) -> Result<()> {
         while self.s < self.src.len() {
             let byte = self.src[self.s];
             self.s += 1;
             if byte & 0b000000_11 == 0 {
                 let len = (byte >> 2) as usize + 1;
+                // Inline the literal fast path here so its `continue`
+                // goes directly to the back edge, preventing LLVM from
+                // tail-merging it with read_literal's slow-path return.
+                if len <= 16
+                    && self.s + 16 <= self.src.len()
+                    && self.d + 16 <= self.dst.len()
+                {
+                    unsafe {
+                        let srcp = self.src.as_ptr().add(self.s);
+                        let dstp = self.dst.as_mut_ptr().add(self.d);
+                        ptr::copy_nonoverlapping(srcp, dstp, 16);
+                    }
+                    self.d += len;
+                    self.s += len;
+                    continue;
+                }
                 self.read_literal(len)?;
             } else {
                 self.read_copy(byte)?;
             }
         }
+        Ok(())
+    }
+
+    fn decompress(&mut self) -> Result<()> {
+        self.decompress_tags()?;
         if self.d != self.dst.len() {
             return Err(Error::HeaderMismatch {
                 expected_len: self.dst.len() as u64,
@@ -161,37 +245,17 @@ impl<'s, 'd> Decompress<'s, 'd> {
     fn read_literal(&mut self, len: usize) -> Result<()> {
         debug_assert!(len <= 64);
         let mut len = len as u64;
-        // As an optimization for the common case, if the literal length is
-        // <=16 and we have enough room in both `src` and `dst`, copy the
-        // literal using unaligned loads and stores.
+        // NOTE: The <= 16 fast path is inlined directly in decompress_tags
+        // to prevent LLVM from tail-merging it with this slow path.
         //
-        // We pick 16 bytes with the hope that it optimizes down to a 128 bit
-        // load/store.
-        if len <= 16
-            && self.s + 16 <= self.src.len()
-            && self.d + 16 <= self.dst.len()
-        {
-            unsafe {
-                // SAFETY: We know both src and dst have at least 16 bytes of
-                // wiggle room after s/d, even if `len` is <16, so the copy is
-                // safe.
-                let srcp = self.src.as_ptr().add(self.s);
-                let dstp = self.dst.as_mut_ptr().add(self.d);
-                // Hopefully uses SIMD registers for 128 bit load/store.
-                ptr::copy_nonoverlapping(srcp, dstp, 16);
-            }
-            self.d += len as usize;
-            self.s += len as usize;
-            return Ok(());
-        }
         // When the length is bigger than 60, it indicates that we need to read
         // an additional 1-4 bytes to get the real length of the literal.
         if len >= 61 {
             // If there aren't at least 4 bytes left to read then we know this
             // is corrupt because the literal must have length >=61.
             if self.s as u64 + 4 > self.src.len() as u64 {
-                return Err(Error::Literal {
-                    len: 4,
+                return Err(Error::LiteralBigLen {
+                    len,
                     src_len: (self.src.len() - self.s) as u64,
                     dst_len: (self.dst.len() - self.d) as u64,
                 });
@@ -246,6 +310,7 @@ impl<'s, 'd> Decompress<'s, 'd> {
             return Err(Error::Offset {
                 offset: offset as u64,
                 dst_pos: self.d as u64,
+                len,
             });
         }
         // When all is said and done, dst is advanced to end.
@@ -329,6 +394,7 @@ impl<'s, 'd> Decompress<'s, 'd> {
                 return Err(Error::CopyWrite {
                     len: len as u64,
                     dst_len: (self.dst.len() - self.d) as u64,
+                    offset: offset as u64,
                 });
             }
             // Finally, the slow byte-by-byte case, which should only be used
@@ -341,6 +407,223 @@ impl<'s, 'd> Decompress<'s, 'd> {
         self.d = end;
         Ok(())
     }
+}
+
+/// DecompressScattered is the state for decompressing from/to scattered
+/// (non-contiguous) buffers.
+struct DecompressScattered<'s, 'd> {
+    /// The scattered input buffers (compressed data, excluding header).
+    src_buffers: &'s [&'s [u8]],
+    src: &'s [u8],
+    s: usize,
+    src_index: usize,
+
+    /// The scattered output buffers.
+    dst_buffers: Vec<&'d mut [u8]>,
+    dst: &'d mut [u8],
+    result_slices: Vec<&'d [u8]>,
+    d: usize,
+}
+
+impl<'s, 'd> DecompressScattered<'s, 'd> {
+
+    /// Advance to the next non-empty source buffer. Returns false if
+    /// there are no more buffers.
+    #[inline(never)]
+    fn handle_boundary_error(&mut self, e: Error) -> Result<()> {
+        match e {
+            Error::Literal { len, .. } => {
+                self.read_literal_across_boundaries(false, len as usize)?;
+            }
+            Error::LiteralBigLen { len, .. } => {
+                self.read_literal_across_boundaries(true, len as usize)?;
+            }
+            Error::CopyRead { .. } => {
+                // Tag byte was consumed by decompress_inner (s += 1) before
+                // read_copy called offset() which failed. Tag is at s-1.
+                let tag_byte = self.src[self.s - 1];
+                let entry = TAG_LOOKUP_TABLE.entry(tag_byte);
+                let num_tag_bytes = entry.num_tag_bytes();
+                let copy_len = entry.len();
+
+                // Read trailer bytes one at a time across buffers.
+                let mut buf = [0u8; 4];
+                for b in buf.iter_mut().take(num_tag_bytes) {
+                    *b = self.read_src_byte();
+                }
+                let trailer =
+                    u32::from_le_bytes(buf) as usize & WORD_MASK[num_tag_bytes];
+                let offset = (entry.0 & 0b0000_0111_0000_0000) | trailer;
+
+                if offset == 0 {
+                    let total = self.total_written();
+                    return Err(Error::Offset {
+                        offset: 0, dst_pos: total as u64, len: copy_len,
+                    });
+                }
+                self.copy_from_output(offset, copy_len)?;
+            }
+            Error::CopyWrite { len, offset, .. } => {
+                self.copy_from_output(offset as usize, len as usize)?;
+            }
+            Error::Offset { offset, len, .. } => {
+                let offset = offset as usize;
+                let total = self.total_written();
+                if offset == 0 || total < offset {
+                    return Err(Error::Offset {
+                        offset: offset as u64, dst_pos: total as u64, len,
+                    });
+                }
+                self.copy_from_output(offset, len)?;
+            }
+            e => return Err(e),
+        }
+        Ok(())
+    }
+
+    /// Run the hot loop on a local `Decompress` struct so the compiler
+    /// can keep s/d in registers (identical codegen to the contiguous path).
+    #[inline(never)]
+    fn decompress_inner(&mut self) -> Result<()> {
+        let (s, d, result) = {
+            let mut inner = Decompress {
+                src: self.src,
+                s: self.s,
+                dst: &mut *self.dst,
+                d: self.d,
+            };
+            let result = inner.decompress_tags();
+            (inner.s, inner.d, result)
+        };
+        self.s = s;
+        self.d = d;
+        result
+    }
+
+    /// Main decompression loop — mirrors contiguous Decompress::decompress.
+    #[inline(never)]
+    fn decompress(&mut self) -> Result<()> {
+        loop {
+            match self.decompress_inner() {
+                Ok(_) => {
+                    // Finished current src buffer — advance to next non-empty one.
+                    self.src_index += 1;
+                    if self.src_index >= self.src_buffers.len() {
+                        return Ok(());
+                    }
+                    self.src = self.src_buffers[self.src_index];
+                    self.s = 0;
+                }
+                Err(e) => {
+                    self.handle_boundary_error(e)?;
+                }
+            }
+        }
+    }
+
+    /// Total bytes written across all output buffers so far.
+    fn total_written(&self) -> usize {
+        self.result_slices.iter().map(|s| s.len()).sum::<usize>() + self.d
+    }
+
+    /// Read a single byte from the total output at absolute position `pos`.
+    fn read_output_byte(&self, pos: usize) -> u8 {
+        let mut remaining = pos;
+        for slice in &self.result_slices {
+            if remaining < slice.len() {
+                return slice[remaining];
+            }
+            remaining -= slice.len();
+        }
+        self.dst[remaining]
+    }
+
+    /// Byte-by-byte copy from already-written output. Handles all boundary
+    /// cases: source in previous buffers, destination crossing buffers,
+    /// and self-referential (overlapping) copies.
+    #[inline(never)]
+    fn copy_from_output(&mut self, offset: usize, len: usize) -> Result<()> {
+        let mut total = self.total_written();
+        for _ in 0..len {
+            let src_pos = total - offset;
+            let byte = self.read_output_byte(src_pos);
+            self.write_dst_byte(byte)?;
+            total += 1;
+        }
+        Ok(())
+    }
+
+    /// Handle a literal whose tag-length bytes or data span source buffer
+    /// boundaries. Simple byte-by-byte — not performance-critical.
+    #[inline(never)]
+    fn read_literal_across_boundaries(&mut self, read_extra: bool, len: usize) -> Result<()> {
+        let mut len = len as u64;
+        if read_extra {
+            debug_assert!(len >= 61);
+            let byte_count = len as usize - 60;
+            let mut buf = [0u8; 4];
+            for b in buf.iter_mut().take(byte_count) {
+                *b = self.read_src_byte();
+            }
+            len = u32::from_le_bytes(buf) as u64;
+            len = (len & (WORD_MASK[byte_count] as u64)) + 1
+        }
+
+        for _ in 0..len {
+            let u8 = self.read_src_byte();
+            self.write_dst_byte(u8)?;
+        }
+        Ok(())
+    }
+
+    fn replace_destination_buffer(&mut self) -> Result<()> {
+        loop {
+            match self.dst_buffers.pop() {
+                Some(s) => {
+                    let finished_slice = mem::replace(&mut self.dst, s);
+                    self.result_slices.push(&finished_slice[..self.d]);
+                    self.d = 0;
+                    if !self.dst.is_empty() {
+                        return Ok(());
+                    }
+                }
+                None => {
+                    return Err(Error::CopyWrite {
+                        len: 0,
+                        dst_len: 0,
+                        offset: 0,
+                    });
+                }
+            }
+        }
+    }
+
+    /// Read a single byte from scattered source, advancing to the next
+    /// buffer if needed.
+    #[inline]
+    fn read_src_byte(&mut self) -> u8 {
+        while self.s >= self.src.len() {
+            self.src_index += 1;
+            self.src = self.src_buffers[self.src_index];
+            self.s = 0;
+        }
+        let b = self.src[self.s];
+        self.s += 1;
+        b
+    }
+
+    /// Write a single byte to scattered output, advancing to the next
+    /// buffer if needed.
+    #[inline]
+    fn write_dst_byte(&mut self, byte: u8) -> Result<()> {
+        if self.d >= self.dst.len() {
+            self.replace_destination_buffer()?;
+        }
+        self.dst[self.d] = byte;
+        self.d += 1;
+        Ok(())
+    }
+
 }
 
 /// Header represents the single varint that starts every Snappy compressed
